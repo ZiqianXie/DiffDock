@@ -1,10 +1,10 @@
 import numpy as np
 import torch
 from torch_geometric.loader import DataLoader
-
 from utils.diffusion_utils import modify_conformer, set_time
 from utils.torsion import modify_conformer_torsion_angles
 from scipy.spatial.transform import Rotation as R
+import scipy.integrate as integrate
 
 
 def randomize_position(data_list, no_torsion, no_random, tr_sigma_max):
@@ -15,8 +15,7 @@ def randomize_position(data_list, no_torsion, no_random, tr_sigma_max):
             torsion_updates = np.random.uniform(low=-np.pi, high=np.pi, size=complex_graph['ligand'].edge_mask.sum())
             complex_graph['ligand'].pos = \
                 modify_conformer_torsion_angles(complex_graph['ligand'].pos,
-                                                complex_graph['ligand', 'ligand'].edge_index.T[
-                                                    complex_graph['ligand'].edge_mask],
+                                                complex_graph['ligand', 'ligand'].edge_index.T[complex_graph['ligand'].edge_mask],
                                                 complex_graph['ligand'].mask_rotate[0], torsion_updates)
 
     for complex_graph in data_list:
@@ -29,6 +28,8 @@ def randomize_position(data_list, no_torsion, no_random, tr_sigma_max):
         if not no_random:  # note for now the torsion angles are still randomised
             tr_update = torch.normal(mean=0, std=tr_sigma_max, size=(1, 3))
             complex_graph['ligand'].pos += tr_update
+            complex_graph['ligand'].loglikelihood = (-tr_update**2/2/tr_sigma_max**2-torch.log(2*np.pi*tr_sigma_max**2)/2).sum()
+            complex_graph['ligand'].loglikelihood_grad = []
 
 
 def sampling(data_list, model, inference_steps, tr_schedule, rot_schedule, tor_schedule, device, t_to_sigma, model_args,
@@ -48,16 +49,16 @@ def sampling(data_list, model, inference_steps, tr_schedule, rot_schedule, tor_s
         for complex_graph_batch in loader:
             b = complex_graph_batch.num_graphs
             complex_graph_batch = complex_graph_batch.to(device)
-
+            pos_list = []
+            for complex_graph in complex_graph_batch:
+                complex_graph_batch['ligand']['pos'].requires_grad_()
+                complex_graph_batch['ligand']['pos'].grad.zero_()
+                pos_list.append(complex_graph['ligand']['pos'].detach())
             tr_sigma, rot_sigma, tor_sigma = t_to_sigma(t_tr, t_rot, t_tor)
             set_time(complex_graph_batch, t_tr, t_rot, t_tor, b, model_args.all_atoms, device)
-            
-            with torch.no_grad():
-                tr_score, rot_score, tor_score = model(complex_graph_batch)
-
+            tr_score, rot_score, tor_score = model(complex_graph_batch)
             tr_g = tr_sigma * torch.sqrt(torch.tensor(2 * np.log(model_args.tr_sigma_max / model_args.tr_sigma_min)))
             rot_g = 2 * rot_sigma * torch.sqrt(torch.tensor(np.log(model_args.rot_sigma_max / model_args.rot_sigma_min)))
-
             if ode:
                 tr_perturb = (0.5 * tr_g ** 2 * dt_tr * tr_score.cpu()).cpu()
                 rot_perturb = (0.5 * rot_score.cpu() * dt_rot * rot_g ** 2).cpu()
@@ -83,15 +84,26 @@ def sampling(data_list, model, inference_steps, tr_schedule, rot_schedule, tor_s
                 tor_perturb = None
 
             # Apply noise
-            new_data_list.extend([modify_conformer(complex_graph, tr_perturb[i:i + 1], rot_perturb[i:i + 1].squeeze(0),
-                                          tor_perturb[i * torsions_per_molecule:(i + 1) * torsions_per_molecule] if not model_args.no_torsion else None)
-                         for i, complex_graph in enumerate(complex_graph_batch.to('cpu').to_data_list())])
+            for i, complex_graph in enumerate(complex_graph_batch.to('cpu').to_data_list()):
+                modify_conformer(complex_graph, tr_perturb[i:i + 1], rot_perturb[i:i + 1].squeeze(0),
+                                          tor_perturb[i * torsions_per_molecule:(i + 1) * torsions_per_molecule])
+                epsilon = torch.randn_like(pos_list[i])
+                score_e = ((complex_graph['ligand']['pos'] - pos_list[i]) * epsilon).sum()
+                score_e.backward()
+                div = (complex_graph['ligand']['pos'].grad * epsilon).sum()
+                complex_graph['ligand'].loglikelihood_grad.append(-div)
+                new_data_list.append(modify_conformer(complex_graph, tr_perturb[i:i + 1], rot_perturb[i:i + 1].squeeze(0),
+                                     tor_perturb[i * torsions_per_molecule:(i + 1) * torsions_per_molecule] if not model_args.no_torsion else None))
+                
         data_list = new_data_list
 
         if visualization_list is not None:
             for idx, visualization in enumerate(visualization_list):
                 visualization.add((data_list[idx]['ligand'].pos + data_list[idx].original_center).detach().cpu(),
                                   part=1, order=t_idx + 2)
+    for complex_graph_batch in DataLoader(data_list, batch_size=batch_size):
+        for complex_graph in complex_graph_batch:
+            complex_graph['ligand'].loglikelihood += integrate.trapz(np.array([tensor.detach().cpu().item() for tensor in complex_graph['ligand'].loglikelihood_grad]), tr_schedule)
 
     with torch.no_grad():
         if confidence_model is not None:
